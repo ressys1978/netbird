@@ -10,7 +10,8 @@ import (
 )
 
 type ProfileState struct {
-	Email string `json:"email"`
+	Email            string `json:"email"`
+	DisableLoginHint bool   `json:"disable_login_hint,omitempty"`
 }
 
 func (pm *ProfileManager) GetProfileState(profileName string) (*ProfileState, error) {
@@ -35,6 +36,14 @@ func (pm *ProfileManager) GetProfileState(profileName string) (*ProfileState, er
 	}
 
 	return &state, nil
+}
+
+func (pm *ProfileManager) GetActiveProfileState() (*ProfileState, error) {
+	activeProf, err := pm.GetActiveProfile()
+	if err != nil {
+		return nil, fmt.Errorf("get active profile: %w", err)
+	}
+	return pm.GetProfileState(activeProf.Name)
 }
 
 func (pm *ProfileManager) SetActiveProfileState(state *ProfileState) error {

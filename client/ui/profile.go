@@ -40,33 +40,53 @@ func (s *serviceClient) showProfilesUI() {
 	list := widget.NewList(
 		func() int { return len(profiles) },
 		func() fyne.CanvasObject {
-			// Each item: Selected indicator, Name, spacer, Select, Logout & Remove buttons
 			return container.NewHBox(
-				widget.NewLabel(""), // indicator
-				widget.NewLabel(""), // profile name
+				widget.NewLabel(""),            // indicator
+				widget.NewLabel(""),            // profile name
 				layout.NewSpacer(),
+				widget.NewCheck("Login Hint", nil), // login hint toggle
 				widget.NewButton("Select", nil),
 				widget.NewButton("Deregister", nil),
 				widget.NewButton("Remove", nil),
 			)
 		},
 		func(i widget.ListItemID, item fyne.CanvasObject) {
-			// Populate each row
 			row := item.(*fyne.Container)
 			indicator := row.Objects[0].(*widget.Label)
 			nameLabel := row.Objects[1].(*widget.Label)
-			selectBtn := row.Objects[3].(*widget.Button)
-			logoutBtn := row.Objects[4].(*widget.Button)
-			removeBtn := row.Objects[5].(*widget.Button)
+			loginHintCheck := row.Objects[3].(*widget.Check)
+			selectBtn := row.Objects[4].(*widget.Button)
+			logoutBtn := row.Objects[5].(*widget.Button)
+			removeBtn := row.Objects[6].(*widget.Button)
 
 			profile := profiles[i]
-			// Show a checkmark if selected
 			if profile.IsActive {
 				indicator.SetText("✓")
 			} else {
 				indicator.SetText("")
 			}
 			nameLabel.SetText(profile.Name)
+
+			profileState, err := s.profileManager.GetProfileState(profile.Name)
+			loginHintEnabled := true
+			if err == nil {
+				loginHintEnabled = !profileState.DisableLoginHint
+			}
+			loginHintCheck.SetChecked(loginHintEnabled)
+
+			if profile.IsActive {
+				loginHintCheck.Enable()
+				loginHintCheck.OnChanged = func(checked bool) {
+					if err := s.profileManager.ToggleLoginHint(!checked); err != nil {
+						log.Errorf("failed to toggle login hint: %v", err)
+						dialog.ShowError(fmt.Errorf("failed to toggle login hint"), s.wProfiles)
+						loginHintCheck.SetChecked(!checked)
+					}
+				}
+			} else {
+				loginHintCheck.Disable()
+				loginHintCheck.OnChanged = nil
+			}
 
 			// Configure Select/Active button
 			selectBtn.SetText(func() string {
@@ -221,7 +241,7 @@ func (s *serviceClient) showProfilesUI() {
 	content := container.NewBorder(nil, newBtn, nil, nil, list)
 	s.wProfiles = s.app.NewWindow("NetBird Profiles")
 	s.wProfiles.SetContent(content)
-	s.wProfiles.Resize(fyne.NewSize(400, 300))
+	s.wProfiles.Resize(fyne.NewSize(500, 300))
 	s.wProfiles.SetOnClosed(s.cancel)
 
 	s.wProfiles.Show()
@@ -394,6 +414,7 @@ type profileMenu struct {
 	emailMenuItem         *systray.MenuItem
 	profileSubItems       []*subItem
 	manageProfilesSubItem *subItem
+	loginHintSubItem      *subItem
 	logoutSubItem         *subItem
 	profilesState         []Profile
 	downClickCallback     func() error
@@ -612,7 +633,37 @@ func (p *profileMenu) refresh() {
 		}
 	}()
 
-	// Add Logout menu item
+	loginHintCtx, loginHintCancel := context.WithCancel(context.Background())
+	loginHintEnabled := true
+	if activeProfState, stateErr := p.profileManager.GetProfileState(activeProf.ProfileName); stateErr == nil {
+		loginHintEnabled = !activeProfState.DisableLoginHint
+	}
+	loginHintItem := p.profileMenuItem.AddSubMenuItem("Login Hint", "Pre-fill email on SSO login")
+	if loginHintEnabled {
+		loginHintItem.Check()
+	}
+	p.loginHintSubItem = &subItem{loginHintItem, loginHintCtx, loginHintCancel}
+
+	go func() {
+		for {
+			select {
+			case <-loginHintCtx.Done():
+				return
+			case _, ok := <-loginHintItem.ClickedCh:
+				if !ok {
+					return
+				}
+				if err := p.profileManager.ToggleLoginHint(loginHintEnabled); err != nil {
+					log.Errorf("failed to toggle login hint: %v", err)
+					p.app.SendNotification(fyne.NewNotification("Error", "Failed to toggle login hint"))
+					continue
+				}
+				p.refresh()
+				return
+			}
+		}
+	}()
+
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	logoutItem := p.profileMenuItem.AddSubMenuItem("Deregister", "")
 	p.logoutSubItem = &subItem{logoutItem, ctx2, cancel2}
@@ -657,6 +708,12 @@ func (p *profileMenu) clear(profiles []Profile) {
 		p.manageProfilesSubItem.Remove()
 		p.manageProfilesSubItem.cancel()
 		p.manageProfilesSubItem = nil
+	}
+
+	if p.loginHintSubItem != nil {
+		p.loginHintSubItem.Remove()
+		p.loginHintSubItem.cancel()
+		p.loginHintSubItem = nil
 	}
 
 	if p.logoutSubItem != nil {
