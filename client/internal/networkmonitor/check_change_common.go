@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -45,7 +47,17 @@ func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Next
 			continue
 		}
 
-		msg := (*unix.RtMsghdr)(unsafe.Pointer(&buf[0]))
+			msg := (*unix.RtMsghdr)(unsafe.Pointer(&buf[0]))
+
+			// On Darwin, RTM_DELETE can be part of a normal VPN connection sequence,
+			// causing spurious disconnects. The wakeup detector provides some resilience against
+			// undetected network loss from sleep, and network recovery is still detected via RTM_ADD.
+			// By ignoring RTM_DELETE, we prioritize stability during VPN handovers over
+			// immediate detection of network loss.
+			if runtime.GOOS == "darwin" && msg.Type == unix.RTM_DELETE {
+				log.Debugf("Network monitor: ignoring RTM_DELETE on darwin to avoid spurious disconnects from VPNs")
+				continue
+			}
 
 		switch msg.Type {
 		// handle route changes
@@ -60,18 +72,25 @@ func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Next
 				continue
 			}
 
-			intf := "<nil>"
-			if route.Interface != nil {
-				intf = route.Interface.Name
-			}
-			switch msg.Type {
-			case unix.RTM_ADD:
-				log.Infof("Network monitor: default route changed: via %s, interface %s", route.Gw, intf)
-				return nil
-			case unix.RTM_DELETE:
-				if nexthopv4.Intf != nil && route.Gw.Compare(nexthopv4.IP) == 0 || nexthopv6.Intf != nil && route.Gw.Compare(nexthopv6.IP) == 0 {
-					log.Infof("Network monitor: default route removed: via %s, interface %s", route.Gw, intf)
+				intf := "<nil>"
+				if route.Interface != nil {
+					intf = route.Interface.Name
+				}
+
+				if strings.HasPrefix(intf, "utun") || strings.HasPrefix(intf, "ipsec") || (intf == "<nil>" && msg.Type == unix.RTM_ADD) {
+					log.Debugf("Network monitor: ignoring route change for interface %s", intf)
+					continue
+				}
+
+				switch msg.Type {
+				case unix.RTM_ADD:
+					log.Infof("Network monitor: default route changed: via %s, interface %s", route.Gw, intf)
 					return nil
+				case unix.RTM_DELETE:
+					if nexthopv4.Intf != nil && route.Gw.Compare(nexthopv4.IP) == 0 || nexthopv6.Intf != nil && route.Gw.Compare(nexthopv6.IP) == 0 {
+						log.Infof("Network monitor: default route removed: via %s, interface %s", route.Gw, intf)
+						return nil
+					}
 				}
 			}
 		}
