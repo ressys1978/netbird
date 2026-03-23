@@ -14,7 +14,7 @@ import (
 
 	"github.com/hashicorp/go-version"
 	"github.com/netbirdio/netbird/idp/dex"
-	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy"
+	rpservice "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/netbirdio/netbird/management/server/types"
@@ -219,7 +219,7 @@ func (w *Worker) generateProperties(ctx context.Context) properties {
 		servicesStatusActive      int
 		servicesStatusPending     int
 		servicesStatusError       int
-		servicesTargetType        map[string]int
+		servicesTargetType        map[rpservice.TargetType]int
 		servicesAuthPassword      int
 		servicesAuthPin           int
 		servicesAuthOIDC          int
@@ -232,7 +232,7 @@ func (w *Worker) generateProperties(ctx context.Context) properties {
 	rulesDirection = make(map[string]int)
 	activeUsersLastDay = make(map[string]struct{})
 	embeddedIdpTypes = make(map[string]int)
-	servicesTargetType = make(map[string]int)
+	servicesTargetType = make(map[rpservice.TargetType]int)
 	uptime = time.Since(w.startupTime).Seconds()
 	connections := w.connManager.GetAllConnectedPeers()
 	version = nbversion.NetbirdVersion()
@@ -294,9 +294,9 @@ func (w *Worker) generateProperties(ctx context.Context) properties {
 							localUsers++
 						} else {
 							idpUsers++
-							idpType := extractIdpType(idpID)
-							embeddedIdpTypes[idpType]++
 						}
+						idpType := extractIdpType(idpID)
+						embeddedIdpTypes[idpType]++
 					}
 				}
 			}
@@ -358,12 +358,12 @@ func (w *Worker) generateProperties(ctx context.Context) properties {
 			}
 			servicesTargets += len(service.Targets)
 
-			switch reverseproxy.ProxyStatus(service.Meta.Status) {
-			case reverseproxy.StatusActive:
+			switch rpservice.Status(service.Meta.Status) {
+			case rpservice.StatusActive:
 				servicesStatusActive++
-			case reverseproxy.StatusPending:
+			case rpservice.StatusPending:
 				servicesStatusPending++
-			case reverseproxy.StatusError, reverseproxy.StatusCertificateFailed, reverseproxy.StatusTunnelNotCreated:
+			case rpservice.StatusError, rpservice.StatusCertificateFailed, rpservice.StatusTunnelNotCreated:
 				servicesStatusError++
 			}
 
@@ -434,7 +434,7 @@ func (w *Worker) generateProperties(ctx context.Context) properties {
 	metricsProperties["custom_domains_validated"] = customDomainsValidated
 
 	for targetType, count := range servicesTargetType {
-		metricsProperties["services_target_type_"+targetType] = count
+		metricsProperties["services_target_type_"+string(targetType)] = count
 	}
 
 	for idpType, count := range embeddedIdpTypes {
@@ -531,6 +531,9 @@ func createPostRequest(ctx context.Context, endpoint string, payloadStr string) 
 // Connector IDs are formatted as "<type>-<xid>" (e.g., "okta-abc123", "zitadel-xyz").
 // Returns the type prefix, or "oidc" if no known prefix is found.
 func extractIdpType(connectorID string) string {
+	if connectorID == "local" {
+		return "local"
+	}
 	idx := strings.LastIndex(connectorID, "-")
 	if idx <= 0 {
 		return "oidc"

@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"fmt"
 
 	pb "github.com/golang/protobuf/proto" // nolint
 	log "github.com/sirupsen/logrus"
@@ -10,7 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/netbirdio/netbird/encryption"
-	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy"
+	rpservice "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service"
 	nbContext "github.com/netbirdio/netbird/management/server/context"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
 	"github.com/netbirdio/netbird/management/server/store"
@@ -39,23 +40,38 @@ func (s *Server) CreateExpose(ctx context.Context, req *proto.EncryptedMessage) 
 		return nil, status.Errorf(codes.Internal, "reverse proxy manager not available")
 	}
 
-	created, err := reverseProxyMgr.CreateServiceFromPeer(ctx, accountID, peer.ID, &reverseproxy.ExposeServiceRequest{
-		NamePrefix: exposeReq.NamePrefix,
-		Port:       int(exposeReq.Port),
-		Protocol:   exposeProtocolToString(exposeReq.Protocol),
-		Domain:     exposeReq.Domain,
-		Pin:        exposeReq.Pin,
-		Password:   exposeReq.Password,
-		UserGroups: exposeReq.UserGroups,
+	if exposeReq.Port > 65535 {
+		return nil, status.Errorf(codes.InvalidArgument, "port out of range: %d", exposeReq.Port)
+	}
+	if exposeReq.ListenPort > 65535 {
+		return nil, status.Errorf(codes.InvalidArgument, "listen_port out of range: %d", exposeReq.ListenPort)
+	}
+
+	mode, err := exposeProtocolToString(exposeReq.Protocol)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	created, err := reverseProxyMgr.CreateServiceFromPeer(ctx, accountID, peer.ID, &rpservice.ExposeServiceRequest{
+		NamePrefix:     exposeReq.NamePrefix,
+		Port:           uint16(exposeReq.Port), //nolint:gosec // validated above
+		Mode:           mode,
+		TargetProtocol: exposeTargetProtocol(exposeReq.Protocol),
+		Domain:         exposeReq.Domain,
+		Pin:            exposeReq.Pin,
+		Password:       exposeReq.Password,
+		UserGroups:     exposeReq.UserGroups,
+		ListenPort:     uint16(exposeReq.ListenPort), //nolint:gosec // validated above
 	})
 	if err != nil {
 		return nil, mapExposeError(ctx, err)
 	}
 
 	return s.encryptResponse(peerKey, &proto.ExposeServiceResponse{
-		ServiceName: created.ServiceName,
-		ServiceUrl:  created.ServiceURL,
-		Domain:      created.Domain,
+		ServiceName:      created.ServiceName,
+		ServiceUrl:       created.ServiceURL,
+		Domain:           created.Domain,
+		PortAutoAssigned: created.PortAutoAssigned,
 	})
 }
 
@@ -77,7 +93,12 @@ func (s *Server) RenewExpose(ctx context.Context, req *proto.EncryptedMessage) (
 		return nil, status.Errorf(codes.Internal, "reverse proxy manager not available")
 	}
 
-	if err := reverseProxyMgr.RenewServiceFromPeer(ctx, accountID, peer.ID, renewReq.Domain); err != nil {
+	serviceID, err := s.resolveServiceID(ctx, renewReq.Domain)
+	if err != nil {
+		return nil, mapExposeError(ctx, err)
+	}
+
+	if err := reverseProxyMgr.RenewServiceFromPeer(ctx, accountID, peer.ID, serviceID); err != nil {
 		return nil, mapExposeError(ctx, err)
 	}
 
@@ -102,7 +123,12 @@ func (s *Server) StopExpose(ctx context.Context, req *proto.EncryptedMessage) (*
 		return nil, status.Errorf(codes.Internal, "reverse proxy manager not available")
 	}
 
-	if err := reverseProxyMgr.StopServiceFromPeer(ctx, accountID, peer.ID, stopReq.Domain); err != nil {
+	serviceID, err := s.resolveServiceID(ctx, stopReq.Domain)
+	if err != nil {
+		return nil, mapExposeError(ctx, err)
+	}
+
+	if err := reverseProxyMgr.StopServiceFromPeer(ctx, accountID, peer.ID, serviceID); err != nil {
 		return nil, mapExposeError(ctx, err)
 	}
 
@@ -167,26 +193,59 @@ func (s *Server) authenticateExposePeer(ctx context.Context, peerKey wgtypes.Key
 	return accountID, peer, nil
 }
 
-func (s *Server) getReverseProxyManager() reverseproxy.Manager {
+func (s *Server) getReverseProxyManager() rpservice.Manager {
 	s.reverseProxyMu.RLock()
 	defer s.reverseProxyMu.RUnlock()
 	return s.reverseProxyManager
 }
 
 // SetReverseProxyManager sets the reverse proxy manager on the server.
-func (s *Server) SetReverseProxyManager(mgr reverseproxy.Manager) {
+func (s *Server) SetReverseProxyManager(mgr rpservice.Manager) {
 	s.reverseProxyMu.Lock()
 	defer s.reverseProxyMu.Unlock()
 	s.reverseProxyManager = mgr
 }
 
-func exposeProtocolToString(p proto.ExposeProtocol) string {
+// resolveServiceID looks up the service by its globally unique domain.
+func (s *Server) resolveServiceID(ctx context.Context, domain string) (string, error) {
+	if domain == "" {
+		return "", status.Errorf(codes.InvalidArgument, "domain is required")
+	}
+
+	svc, err := s.accountManager.GetStore().GetServiceByDomain(ctx, domain)
+	if err != nil {
+		return "", err
+	}
+	return svc.ID, nil
+}
+
+func exposeProtocolToString(p proto.ExposeProtocol) (string, error) {
 	switch p {
-	case proto.ExposeProtocol_EXPOSE_HTTP:
-		return "http"
-	case proto.ExposeProtocol_EXPOSE_HTTPS:
-		return "https"
+	case proto.ExposeProtocol_EXPOSE_HTTP, proto.ExposeProtocol_EXPOSE_HTTPS:
+		return "http", nil
+	case proto.ExposeProtocol_EXPOSE_TCP:
+		return "tcp", nil
+	case proto.ExposeProtocol_EXPOSE_UDP:
+		return "udp", nil
+	case proto.ExposeProtocol_EXPOSE_TLS:
+		return "tls", nil
 	default:
-		return "http"
+		return "", fmt.Errorf("unsupported expose protocol: %v", p)
+	}
+}
+
+// exposeTargetProtocol returns the target protocol for the given expose protocol.
+// For HTTP mode, this is http or https (the scheme used to connect to the backend).
+// For L4 modes, this is tcp or udp (the transport used to connect to the backend).
+func exposeTargetProtocol(p proto.ExposeProtocol) string {
+	switch p {
+	case proto.ExposeProtocol_EXPOSE_HTTPS:
+		return rpservice.TargetProtoHTTPS
+	case proto.ExposeProtocol_EXPOSE_TCP, proto.ExposeProtocol_EXPOSE_TLS:
+		return rpservice.TargetProtoTCP
+	case proto.ExposeProtocol_EXPOSE_UDP:
+		return rpservice.TargetProtoUDP
+	default:
+		return rpservice.TargetProtoHTTP
 	}
 }
