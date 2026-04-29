@@ -17,6 +17,27 @@ const (
 	TokenAuthScopes  = "TokenAuth.Scopes"
 )
 
+// Defines values for AccessRestrictionsCrowdsecMode.
+const (
+	AccessRestrictionsCrowdsecModeEnforce AccessRestrictionsCrowdsecMode = "enforce"
+	AccessRestrictionsCrowdsecModeObserve AccessRestrictionsCrowdsecMode = "observe"
+	AccessRestrictionsCrowdsecModeOff     AccessRestrictionsCrowdsecMode = "off"
+)
+
+// Valid indicates whether the value is a known member of the AccessRestrictionsCrowdsecMode enum.
+func (e AccessRestrictionsCrowdsecMode) Valid() bool {
+	switch e {
+	case AccessRestrictionsCrowdsecModeEnforce:
+		return true
+	case AccessRestrictionsCrowdsecModeObserve:
+		return true
+	case AccessRestrictionsCrowdsecModeOff:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CreateAzureIntegrationRequestHost.
 const (
 	CreateAzureIntegrationRequestHostMicrosoftCom CreateAzureIntegrationRequestHost = "microsoft.com"
@@ -497,6 +518,7 @@ const (
 	IdentityProviderTypeOkta      IdentityProviderType = "okta"
 	IdentityProviderTypePocketid  IdentityProviderType = "pocketid"
 	IdentityProviderTypeZitadel   IdentityProviderType = "zitadel"
+	IdentityProviderTypeAdfs      IdentityProviderType = "adfs"
 )
 
 // Valid indicates whether the value is a known member of the IdentityProviderType enum.
@@ -515,6 +537,8 @@ func (e IdentityProviderType) Valid() bool {
 	case IdentityProviderTypePocketid:
 		return true
 	case IdentityProviderTypeZitadel:
+		return true
+	case IdentityProviderTypeAdfs:
 		return true
 	default:
 		return false
@@ -1326,7 +1350,13 @@ type AccessRestrictions struct {
 
 	// BlockedCountries ISO 3166-1 alpha-2 country codes to block.
 	BlockedCountries *[]string `json:"blocked_countries,omitempty"`
+
+	// CrowdsecMode CrowdSec IP reputation mode. Only available when the proxy cluster supports CrowdSec.
+	CrowdsecMode *AccessRestrictionsCrowdsecMode `json:"crowdsec_mode,omitempty"`
 }
+
+// AccessRestrictionsCrowdsecMode CrowdSec IP reputation mode. Only available when the proxy cluster supports CrowdSec.
+type AccessRestrictionsCrowdsecMode string
 
 // AccessiblePeer defines model for AccessiblePeer.
 type AccessiblePeer struct {
@@ -3680,6 +3710,9 @@ type ProxyAccessLog struct {
 	// Id Unique identifier for the access log entry
 	Id string `json:"id"`
 
+	// Metadata Extra context about the request (e.g. crowdsec_verdict)
+	Metadata *map[string]string `json:"metadata,omitempty"`
+
 	// Method HTTP method of the request
 	Method string `json:"method"`
 
@@ -3758,6 +3791,9 @@ type ReverseProxyDomain struct {
 
 	// RequireSubdomain Whether a subdomain label is required in front of this domain. When true, the domain cannot be used bare.
 	RequireSubdomain *bool `json:"require_subdomain,omitempty"`
+
+	// SupportsCrowdsec Whether the proxy cluster has CrowdSec configured
+	SupportsCrowdsec *bool `json:"supports_crowdsec,omitempty"`
 
 	// SupportsCustomPorts Whether the cluster supports binding arbitrary TCP/UDP ports
 	SupportsCustomPorts *bool `json:"supports_custom_ports,omitempty"`
