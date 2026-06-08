@@ -14,6 +14,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/debug"
 	"github.com/netbirdio/netbird/client/proto"
 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
+	"github.com/netbirdio/netbird/version"
 )
 
 // DebugBundle creates a debug bundle and returns the location.
@@ -43,7 +44,9 @@ func (s *Server) DebugBundle(_ context.Context, req *proto.DebugBundleRequest) (
 		}()
 	}
 
-	// Prepare refresh callback for health probes
+	capturePath := s.bundleCapturePath()
+	defer s.cleanupBundleCapture()
+
 	var refreshStatus func()
 	if s.connectClient != nil {
 		engine := s.connectClient.Engine()
@@ -62,8 +65,11 @@ func (s *Server) DebugBundle(_ context.Context, req *proto.DebugBundleRequest) (
 			SyncResponse:   syncResponse,
 			LogPath:        s.logFile,
 			CPUProfile:     cpuProfileData,
+			CapturePath:    capturePath,
 			RefreshStatus:  refreshStatus,
 			ClientMetrics:  clientMetrics,
+			DaemonVersion:  version.NetbirdVersion(),
+			CliVersion:     req.CliVersion,
 		},
 		debug.BundleConfig{
 			Anonymize:         req.GetAnonymize(),

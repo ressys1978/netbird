@@ -52,6 +52,14 @@ service ManagementService {
   // Executes a job on a target peer (e.g., debug bundle)
   rpc Job(stream EncryptedMessage) returns (stream EncryptedMessage) {}
 
+  // ExtendAuthSession refreshes the peer's session expiry deadline using a fresh JWT.
+  // Same JWT validation pipeline as Login (including jwt.UserID == peer.UserID check),
+  // but does not redo the network-map sync. Only valid for SSO-registered peers where
+  // login expiration is enabled. The tunnel remains up.
+  // EncryptedMessage of the request has a body of ExtendAuthSessionRequest.
+  // EncryptedMessage of the response has a body of ExtendAuthSessionResponse.
+  rpc ExtendAuthSession(EncryptedMessage) returns (EncryptedMessage) {}
+
   // CreateExpose creates a temporary reverse proxy service for a peer
   rpc CreateExpose(EncryptedMessage) returns (EncryptedMessage) {}
 
@@ -133,6 +141,15 @@ message SyncResponse {
 
   // Posture checks to be evaluated by client
   repeated Checks Checks = 6;
+
+  // 3-state session deadline. Carried on every Sync snapshot so admin-side
+  // changes propagate live without a client reconnect.
+  //   field unset (nil)        → snapshot carries no info; client keeps the
+  //                              deadline it already had
+  //   set, seconds=0 nanos=0   → explicit "expiry disabled" or peer is not
+  //                              SSO-registered; client clears its anchor
+  //   set, valid timestamp     → new absolute UTC deadline
+  google.protobuf.Timestamp sessionExpiresAt = 7;
 }
 
 message  SyncMetaRequest {
@@ -200,6 +217,18 @@ message Flags {
   bool enableSSHLocalPortForwarding = 13;
   bool enableSSHRemotePortForwarding = 14;
   bool disableSSHAuth = 15;
+
+  bool disableIPv6 = 16;
+}
+
+// PeerCapability represents a feature the client binary supports.
+// Reported in PeerSystemMeta.capabilities on every login/sync.
+enum PeerCapability {
+  PeerCapabilityUnknown = 0;
+  // Client reads SourcePrefixes instead of the deprecated PeerIP string.
+  PeerCapabilitySourcePrefixes = 1;
+  // Client handles IPv6 overlay addresses and firewall rules.
+  PeerCapabilityIPv6Overlay = 2;
 }
 
 // PeerSystemMeta is machine meta data like OS and version.
@@ -221,6 +250,8 @@ message PeerSystemMeta {
   Environment environment = 15;
   repeated File files = 16;
   Flags flags = 17;
+
+  repeated PeerCapability capabilities = 18;
 }
 
 message LoginResponse {
@@ -230,6 +261,31 @@ message LoginResponse {
   PeerConfig peerConfig = 2;
   // Posture checks to be evaluated by client
   repeated Checks Checks = 3;
+
+  // 3-state session deadline; same encoding as SyncResponse.sessionExpiresAt.
+  //   field unset (nil)        → no info; client keeps any deadline it had
+  //   set, seconds=0 nanos=0   → explicit "expiry disabled" / non-SSO peer
+  //   set, valid timestamp     → new absolute UTC deadline
+  google.protobuf.Timestamp sessionExpiresAt = 4;
+}
+
+// ExtendAuthSessionRequest carries a fresh JWT to refresh the peer's session deadline.
+// The encrypted body of an EncryptedMessage with this payload is sent to the
+// ExtendAuthSession RPC.
+message ExtendAuthSessionRequest {
+  // SSO token (must be a fresh, valid JWT for the peer's owning user)
+  string jwtToken = 1;
+  // Meta data of the peer (used for IdP user info refresh consistent with Login)
+  PeerSystemMeta meta = 2;
+}
+
+// ExtendAuthSessionResponse contains the refreshed session deadline.
+message ExtendAuthSessionResponse {
+  // 3-state session deadline; same encoding as SyncResponse.sessionExpiresAt.
+  // In practice ExtendAuthSession only succeeds for SSO peers with expiry
+  // enabled, so this carries a valid timestamp on the success path. The
+  // 3-state encoding is documented here for symmetry with Login/Sync.
+  google.protobuf.Timestamp sessionExpiresAt = 1;
 }
 
 message ServerKeyResponse {
@@ -335,6 +391,9 @@ message PeerConfig {
 
   // Auto-update config
   AutoUpdateSettings autoUpdate = 8;
+
+  // IPv6 overlay address as compact bytes: 16 bytes IP + 1 byte prefix length.
+  bytes address_v6 = 9;
 }
 
 message AutoUpdateSettings {
@@ -567,7 +626,8 @@ enum RuleAction {
 
 // FirewallRule represents a firewall rule
 message FirewallRule {
-  string PeerIP = 1;
+  // Use sourcePrefixes instead.
+  string PeerIP = 1 [deprecated = true];
   RuleDirection Direction = 2;
   RuleAction Action = 3;
   RuleProtocol Protocol = 4;
@@ -576,6 +636,13 @@ message FirewallRule {
 
   // PolicyID is the ID of the policy that this rule belongs to
   bytes PolicyID = 7;
+
+  // CustomProtocol is a custom protocol ID when Protocol is CUSTOM.
+  uint32 customProtocol = 8;
+
+  // Compact source IP prefixes for this rule, supersedes PeerIP.
+  // Each entry is 5 bytes (v4) or 17 bytes (v6): [IP bytes][1 byte prefix_len].
+  repeated bytes sourcePrefixes = 9;
 }
 
 message NetworkAddress {

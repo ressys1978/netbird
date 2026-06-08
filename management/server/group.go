@@ -32,7 +32,7 @@ func (e *GroupLinkError) Error() string {
 
 // CheckGroupPermissions validates if a user has the necessary permissions to view groups
 func (am *DefaultAccountManager) CheckGroupPermissions(ctx context.Context, accountID, userID string) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Read)
+	allowed, _, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Read)
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func (am *DefaultAccountManager) GetGroupByName(ctx context.Context, groupName, 
 
 // CreateGroup object of the peers
 func (am *DefaultAccountManager) CreateGroup(ctx context.Context, accountID, userID string, newGroup *types.Group) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Create)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Create)
 	if err != nil {
 		return status.NewPermissionValidationError(err)
 	}
@@ -117,7 +117,7 @@ func (am *DefaultAccountManager) CreateGroup(ctx context.Context, accountID, use
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationCreate})
 	}
 
 	return nil
@@ -125,7 +125,7 @@ func (am *DefaultAccountManager) CreateGroup(ctx context.Context, accountID, use
 
 // UpdateGroup object of the peers
 func (am *DefaultAccountManager) UpdateGroup(ctx context.Context, accountID, userID string, newGroup *types.Group) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Update)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Update)
 	if err != nil {
 		return status.NewPermissionValidationError(err)
 	}
@@ -174,6 +174,10 @@ func (am *DefaultAccountManager) UpdateGroup(ctx context.Context, accountID, use
 			return err
 		}
 
+		if err = am.reconcileIPv6ForGroupChanges(ctx, transaction, accountID, []string{newGroup.ID}); err != nil {
+			return err
+		}
+
 		return transaction.IncrementNetworkSerial(ctx, accountID)
 	})
 	if err != nil {
@@ -185,7 +189,7 @@ func (am *DefaultAccountManager) UpdateGroup(ctx context.Context, accountID, use
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return nil
@@ -196,7 +200,7 @@ func (am *DefaultAccountManager) UpdateGroup(ctx context.Context, accountID, use
 // It is the caller's responsibility to ensure proper locking is in place before invoking this method.
 // This method will not create group peer membership relations. Use AddPeerToGroup or RemovePeerFromGroup methods for that.
 func (am *DefaultAccountManager) CreateGroups(ctx context.Context, accountID, userID string, groups []*types.Group) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Create)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Create)
 	if err != nil {
 		return status.NewPermissionValidationError(err)
 	}
@@ -253,7 +257,7 @@ func (am *DefaultAccountManager) CreateGroups(ctx context.Context, accountID, us
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationCreate})
 	}
 
 	return globalErr
@@ -264,7 +268,7 @@ func (am *DefaultAccountManager) CreateGroups(ctx context.Context, accountID, us
 // It is the caller's responsibility to ensure proper locking is in place before invoking this method.
 // This method will not create group peer membership relations. Use AddPeerToGroup or RemovePeerFromGroup methods for that.
 func (am *DefaultAccountManager) UpdateGroups(ctx context.Context, accountID, userID string, groups []*types.Group) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Update)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Update)
 	if err != nil {
 		return status.NewPermissionValidationError(err)
 	}
@@ -278,37 +282,17 @@ func (am *DefaultAccountManager) UpdateGroups(ctx context.Context, accountID, us
 	var globalErr error
 	groupIDs := make([]string, 0, len(groups))
 	for _, newGroup := range groups {
-		err = am.Store.ExecuteInTransaction(ctx, func(transaction store.Store) error {
-			if err = validateNewGroup(ctx, transaction, accountID, newGroup); err != nil {
-				return err
-			}
-
-			newGroup.AccountID = accountID
-
-			if err = transaction.UpdateGroup(ctx, newGroup); err != nil {
-				return err
-			}
-
-			err = transaction.IncrementNetworkSerial(ctx, accountID)
-			if err != nil {
-				return err
-			}
-
-			events := am.prepareGroupEvents(ctx, transaction, accountID, userID, newGroup)
-			eventsToStore = append(eventsToStore, events...)
-
-			groupIDs = append(groupIDs, newGroup.ID)
-
-			return nil
-		})
+		events, err := am.updateSingleGroup(ctx, accountID, userID, newGroup)
 		if err != nil {
 			log.WithContext(ctx).Errorf("failed to update group %s: %v", newGroup.ID, err)
 			if len(groups) == 1 {
 				return err
 			}
 			globalErr = errors.Join(globalErr, err)
-			// continue updating other groups
+			continue
 		}
+		eventsToStore = append(eventsToStore, events...)
+		groupIDs = append(groupIDs, newGroup.ID)
 	}
 
 	updateAccountPeers, err = areGroupChangesAffectPeers(ctx, am.Store, accountID, groupIDs)
@@ -321,10 +305,37 @@ func (am *DefaultAccountManager) UpdateGroups(ctx context.Context, accountID, us
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return globalErr
+}
+
+func (am *DefaultAccountManager) updateSingleGroup(ctx context.Context, accountID, userID string, newGroup *types.Group) ([]func(), error) {
+	var events []func()
+	err := am.Store.ExecuteInTransaction(ctx, func(transaction store.Store) error {
+		if err := validateNewGroup(ctx, transaction, accountID, newGroup); err != nil {
+			return err
+		}
+
+		newGroup.AccountID = accountID
+
+		if err := transaction.UpdateGroup(ctx, newGroup); err != nil {
+			return err
+		}
+
+		if err := am.reconcileIPv6ForGroupChanges(ctx, transaction, accountID, []string{newGroup.ID}); err != nil {
+			return err
+		}
+
+		if err := transaction.IncrementNetworkSerial(ctx, accountID); err != nil {
+			return err
+		}
+
+		events = am.prepareGroupEvents(ctx, transaction, accountID, userID, newGroup)
+		return nil
+	})
+	return events, err
 }
 
 // prepareGroupEvents prepares a list of event functions to be stored.
@@ -416,7 +427,7 @@ func (am *DefaultAccountManager) DeleteGroup(ctx context.Context, accountID, use
 // If an error occurs while deleting a group, the function skips it and continues deleting other groups.
 // Errors are collected and returned at the end.
 func (am *DefaultAccountManager) DeleteGroups(ctx context.Context, accountID, userID string, groupIDs []string) error {
-	allowed, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Delete)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Groups, operations.Delete)
 	if err != nil {
 		return status.NewPermissionValidationError(err)
 	}
@@ -458,6 +469,10 @@ func (am *DefaultAccountManager) DeleteGroups(ctx context.Context, accountID, us
 			return err
 		}
 
+		if err = am.reconcileIPv6ForGroupChanges(ctx, transaction, accountID, groupIDsToDelete); err != nil {
+			return err
+		}
+
 		return transaction.IncrementNetworkSerial(ctx, accountID)
 	})
 	if err != nil {
@@ -486,6 +501,10 @@ func (am *DefaultAccountManager) GroupAddPeer(ctx context.Context, accountID, gr
 			return err
 		}
 
+		if err = am.reconcileIPv6ForGroupChanges(ctx, transaction, accountID, []string{groupID}); err != nil {
+			return err
+		}
+
 		return transaction.IncrementNetworkSerial(ctx, accountID)
 	})
 	if err != nil {
@@ -493,7 +512,7 @@ func (am *DefaultAccountManager) GroupAddPeer(ctx context.Context, accountID, gr
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return nil
@@ -531,7 +550,7 @@ func (am *DefaultAccountManager) GroupAddResource(ctx context.Context, accountID
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return nil
@@ -552,6 +571,10 @@ func (am *DefaultAccountManager) GroupDeletePeer(ctx context.Context, accountID,
 			return err
 		}
 
+		if err = am.reconcileIPv6ForGroupChanges(ctx, transaction, accountID, []string{groupID}); err != nil {
+			return err
+		}
+
 		return transaction.IncrementNetworkSerial(ctx, accountID)
 	})
 	if err != nil {
@@ -559,7 +582,7 @@ func (am *DefaultAccountManager) GroupDeletePeer(ctx context.Context, accountID,
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return nil
@@ -597,7 +620,7 @@ func (am *DefaultAccountManager) GroupDeleteResource(ctx context.Context, accoun
 	}
 
 	if updateAccountPeers {
-		am.UpdateAccountPeers(ctx, accountID)
+		am.UpdateAccountPeers(ctx, accountID, types.UpdateReason{Resource: types.UpdateResourceGroup, Operation: types.UpdateOperationUpdate})
 	}
 
 	return nil

@@ -246,27 +246,23 @@ func (c *GrpcClient) handleJobStream(
 	for {
 		jobReq, err := c.receiveJobRequest(ctx, stream, serverPubKey)
 		if err != nil {
+			if ctx.Err() != nil {
+				log.Debugf("job stream context has been canceled, this usually indicates shutdown")
+				return nil
+			}
 			if s, ok := gstatus.FromError(err); ok {
 				switch s.Code() {
 				case codes.PermissionDenied:
 					c.notifyDisconnected(err)
 					return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
-				case codes.Canceled:
-					log.Debugf("job stream context has been canceled, this usually indicates shutdown")
-					return err
 				case codes.Unimplemented:
 					log.Warn("Job feature is not supported by the current management server version. " +
 						"Please update the management service to use this feature.")
 					return nil
-				default:
-					log.Warnf("job stream disconnected, will retry silently. Reason: %v", err)
-					return err
 				}
-			} else {
-				// non-gRPC error
-				log.Warnf("job stream disconnected, will retry silently. Reason: %v", err)
-				return err
 			}
+			log.Warnf("job stream disconnected, will retry silently. Reason: %v", err)
+			return err
 		}
 
 		if jobReq == nil || len(jobReq.ID) == 0 {
@@ -381,22 +377,15 @@ func (c *GrpcClient) handleSyncStream(ctx context.Context, serverPubKey wgtypes.
 	err = c.receiveUpdatesEvents(stream, serverPubKey, msgHandler)
 	if err != nil {
 		c.notifyDisconnected(err)
-		if s, ok := gstatus.FromError(err); ok {
-			switch s.Code() {
-			case codes.PermissionDenied:
-				return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
-			case codes.Canceled:
-				log.Debugf("management connection context has been canceled, this usually indicates shutdown")
-				return nil
-			default:
-				log.Warnf("disconnected from the Management service but will retry silently. Reason: %v", err)
-				return err
-			}
-		} else {
-			// non-gRPC error
-			log.Warnf("disconnected from the Management service but will retry silently. Reason: %v", err)
-			return err
+		if ctx.Err() != nil {
+			log.Debugf("management connection context has been canceled, this usually indicates shutdown")
+			return nil
 		}
+		if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
+			return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
+		}
+		log.Warnf("disconnected from the Management service but will retry silently. Reason: %v", err)
+		return err
 	}
 
 	return nil
@@ -616,6 +605,61 @@ func (c *GrpcClient) Login(sysInfo *system.Info, pubSSHKey []byte, dnsLabels dom
 		WgPubKey:  []byte(c.key.PublicKey().String()),
 	}
 	return c.login(&proto.LoginRequest{Meta: infoToMetaData(sysInfo), PeerKeys: keys, DnsLabels: dnsLabels.ToPunycodeList()})
+}
+
+// ExtendAuthSession refreshes the peer's SSO session deadline on the management
+// server using a freshly issued JWT. The tunnel is untouched: no network map
+// sync, no peer reconnect. Returns the new absolute UTC deadline (zero time
+// when the server reports the field empty).
+func (c *GrpcClient) ExtendAuthSession(sysInfo *system.Info, jwtToken string) (*proto.ExtendAuthSessionResponse, error) {
+	if !c.ready() {
+		return nil, errors.New(errMsgNoMgmtConnection)
+	}
+
+	serverKey, err := c.getServerPublicKey()
+	if err != nil {
+		return nil, err
+	}
+
+	reqBody, err := encryption.EncryptMessage(*serverKey, c.key, &proto.ExtendAuthSessionRequest{
+		JwtToken: jwtToken,
+		Meta:     infoToMetaData(sysInfo),
+	})
+	if err != nil {
+		log.Errorf("failed to encrypt extend auth session message: %s", err)
+		return nil, err
+	}
+
+	var resp *proto.EncryptedMessage
+	operation := func() error {
+		mgmCtx, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
+		defer cancel()
+
+		var err error
+		resp, err = c.realClient.ExtendAuthSession(mgmCtx, &proto.EncryptedMessage{
+			WgPubKey: c.key.PublicKey().String(),
+			Body:     reqBody,
+		})
+		if err != nil {
+			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.Canceled {
+				return err
+			}
+			return backoff.Permanent(err)
+		}
+		return nil
+	}
+
+	if err := backoff.Retry(operation, nbgrpc.Backoff(c.ctx)); err != nil {
+		log.Errorf("failed to extend auth session on Management Service: %v", err)
+		return nil, err
+	}
+
+	out := &proto.ExtendAuthSessionResponse{}
+	if err := encryption.DecryptMessage(*serverKey, c.key, resp.Body, out); err != nil {
+		log.Errorf("failed to decrypt extend auth session response: %s", err)
+		return nil, err
+	}
+	return out, nil
 }
 
 // GetDeviceAuthorizationFlow returns a device authorization flow information.
@@ -948,8 +992,22 @@ func infoToMetaData(info *system.Info) *proto.PeerSystemMeta {
 			DisableFirewall:     info.DisableFirewall,
 			BlockLANAccess:      info.BlockLANAccess,
 			BlockInbound:        info.BlockInbound,
+			DisableIPv6:         info.DisableIPv6,
 
 			LazyConnectionEnabled: info.LazyConnectionEnabled,
 		},
+
+		Capabilities: peerCapabilities(*info),
 	}
+}
+
+// peerCapabilities returns the capabilities this client supports.
+func peerCapabilities(info system.Info) []proto.PeerCapability {
+	caps := []proto.PeerCapability{
+		proto.PeerCapability_PeerCapabilitySourcePrefixes,
+	}
+	if !info.DisableIPv6 {
+		caps = append(caps, proto.PeerCapability_PeerCapabilityIPv6Overlay)
+	}
+	return caps
 }

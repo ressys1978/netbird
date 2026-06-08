@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 
-	"github.com/netbirdio/management-integrations/integrations"
+	"github.com/netbirdio/netbird/management/server/integrations/integrated_validator/validator"
 
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller"
 	"github.com/netbirdio/netbird/management/internals/controllers/network_map/update_channel"
@@ -104,7 +104,7 @@ func TestConnectWithRetryRuns(t *testing.T) {
 		t.Fatalf("failed to set active profile state: %v", err)
 	}
 
-	s := New(ctx, "debug", "", false, false, false)
+	s := New(ctx, "debug", "", false, false, false, false)
 
 	s.config = config
 
@@ -165,7 +165,7 @@ func TestServer_Up(t *testing.T) {
 		t.Fatalf("failed to set active profile state: %v", err)
 	}
 
-	s := New(ctx, "console", "", false, false, false)
+	s := New(ctx, "console", "", false, false, false, false)
 	err = s.Start()
 	require.NoError(t, err)
 
@@ -235,7 +235,7 @@ func TestServer_SubcribeEvents(t *testing.T) {
 		t.Fatalf("failed to set active profile state: %v", err)
 	}
 
-	s := New(ctx, "console", "", false, false, false)
+	s := New(ctx, "console", "", false, false, false, false)
 
 	err = s.Start()
 	require.NoError(t, err)
@@ -315,7 +315,7 @@ func startManagement(t *testing.T, signalAddr string, counter *int) (*grpc.Serve
 		return nil, "", err
 	}
 
-	ia, _ := integrations.NewIntegratedValidator(context.Background(), peersManager, settingsManagerMock, eventStore, cacheStore)
+	ia, _ := validator.NewIntegratedValidator(context.Background(), peersManager, settingsManagerMock, eventStore, cacheStore)
 
 	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
 	require.NoError(t, err)

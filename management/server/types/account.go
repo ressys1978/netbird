@@ -3,7 +3,6 @@ package types
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -30,10 +29,13 @@ import (
 	"github.com/netbirdio/netbird/route"
 	"github.com/netbirdio/netbird/shared/management/domain"
 	"github.com/netbirdio/netbird/shared/management/status"
+	"github.com/netbirdio/netbird/version"
 )
 
 const (
-	defaultTTL                      = 300
+	defaultTTL = 300
+	// privateServiceDNSRecordTTL is short so proxy-peer changes propagate quickly to clients.
+	privateServiceDNSRecordTTL      = 5
 	DefaultPeerLoginExpiration      = 24 * time.Hour
 	DefaultPeerInactivityExpiration = 10 * time.Minute
 
@@ -255,6 +257,149 @@ func getUniqueHostLabel(name string, peerLabels LookupMap) string {
 	return ""
 }
 
+// SynthesizePrivateServiceZones returns in-memory CustomZones with A records pointing each enabled private service the peer can reach at the cluster's proxy-peer IPs. One zone per cluster (multiple services share); records gated by AccessGroups.
+func (a *Account) SynthesizePrivateServiceZones(peerID string) []nbdns.CustomZone {
+	peer, ok := a.Peers[peerID]
+	if !ok || peer == nil {
+		return nil
+	}
+	if len(a.Services) == 0 {
+		return nil
+	}
+
+	proxyPeersByCluster := a.GetProxyPeers()
+	if len(proxyPeersByCluster) == 0 {
+		return nil
+	}
+
+	peerGroups := a.GetPeerGroups(peerID)
+	zonesByApex := map[string]*nbdns.CustomZone{}
+
+	for _, svc := range a.Services {
+		if svc == nil || !svc.Enabled || !svc.Private {
+			continue
+		}
+		if len(svc.AccessGroups) == 0 {
+			continue
+		}
+		if !peerInDistributionGroups(peerGroups, svc.AccessGroups) {
+			continue
+		}
+		proxyPeers := proxyPeersByCluster[svc.ProxyCluster]
+		if len(proxyPeers) == 0 {
+			continue
+		}
+
+		serviceDomainZone := a.privateServiceDomainZone(svc)
+		if serviceDomainZone == "" {
+			continue
+		}
+
+		zone, exists := zonesByApex[serviceDomainZone]
+		if !exists {
+			// NonAuthoritative makes this a match-only zone: queries for
+			// names without an explicit record fall through to the
+			// upstream resolver instead of returning NXDOMAIN. Without
+			// it, adding a single private service would black-hole every
+			// other name under the zone apex.
+			zone = &nbdns.CustomZone{
+				Domain:           dns.Fqdn(serviceDomainZone),
+				Records:          []nbdns.SimpleRecord{},
+				NonAuthoritative: true,
+			}
+			zonesByApex[serviceDomainZone] = zone
+		}
+
+		emitted := 0
+		skippedDisconnected := 0
+		for _, p := range proxyPeers {
+			if p == nil || !p.IP.IsValid() {
+				continue
+			}
+			// Only emit a record when the proxy peer is actually
+			// connected. A disconnected proxy peer's tunnel IP won't
+			// answer; pointing DNS at it would produce a black hole
+			// for as long as the record is cached client-side.
+			if p.Status == nil || !p.Status.Connected {
+				skippedDisconnected++
+				continue
+			}
+			zone.Records = append(zone.Records, nbdns.SimpleRecord{
+				Name:  dns.Fqdn(svc.Domain),
+				Type:  int(dns.TypeA),
+				Class: nbdns.DefaultClass,
+				TTL:   privateServiceDNSRecordTTL,
+				RData: p.IP.String(),
+			})
+			emitted++
+		}
+		// Disagreement with the firewall path is the typical
+		// "domain doesn't reach client but firewall rules do"
+		// symptom: the synth service is otherwise fine, only the
+		// proxy peer's persisted Connected flag is wrong (most
+		// likely the connection reaper marked it disconnected even
+		// though the gRPC stream is alive).
+		if emitted == 0 && skippedDisconnected > 0 {
+			log.Debugf("private-zone synth: svc %s domain=%s cluster=%s emitted_zero proxy_peers=%d all_disconnected=%d (firewall would still fire)",
+				svc.ID, svc.Domain, svc.ProxyCluster, len(proxyPeers), skippedDisconnected)
+		}
+	}
+
+	out := make([]nbdns.CustomZone, 0, len(zonesByApex))
+	for _, zone := range zonesByApex {
+		if len(zone.Records) == 0 {
+			continue
+		}
+		out = append(out, *zone)
+	}
+	if len(out) == 0 && len(a.Services) > 0 {
+		// Targeted diagnostic for the "firewall yes, DNS no" divergence —
+		// fires only when services exist but synth returns zero zones,
+		// so accounts without private services produce no noise.
+		log.Debugf("private-zone synth: peer %s account %s returned 0 zones from %d candidate service(s)",
+			peerID, a.Id, len(a.Services))
+	}
+	return out
+}
+
+// privateServiceDomainZone returns the DNS zone name for the given private service domain by
+// looking at the proxy cluster domain then the custom domains.
+func (a *Account) privateServiceDomainZone(svc *service.Service) string {
+	if domainFromSuffix(svc.Domain, svc.ProxyCluster) {
+		return svc.ProxyCluster
+	}
+
+	// Longest matching custom domain wins
+	zoneName := ""
+	for _, d := range a.Domains {
+		if d == nil || d.TargetCluster != svc.ProxyCluster {
+			continue
+		}
+		if domainFromSuffix(svc.Domain, d.Domain) && len(d.Domain) > len(zoneName) {
+			zoneName = d.Domain
+		}
+	}
+	return zoneName
+}
+
+func domainFromSuffix(domain, suffix string) bool {
+	if suffix == "" {
+		return false
+	}
+	return domain == suffix || strings.HasSuffix(domain, "."+suffix)
+}
+
+// peerInDistributionGroups reports whether any of the peer's groups
+// matches the service's bearer-auth distribution_groups.
+func peerInDistributionGroups(peerGroups LookupMap, distributionGroups []string) bool {
+	for _, gid := range distributionGroups {
+		if _, ok := peerGroups[gid]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Account) GetPeersCustomZone(ctx context.Context, dnsDomain string) nbdns.CustomZone {
 	var merr *multierror.Error
 
@@ -270,6 +415,8 @@ func (a *Account) GetPeersCustomZone(ctx context.Context, dnsDomain string) nbdn
 
 	domainSuffix := "." + dnsDomain
 
+	ipv6AllowedPeers := a.peerIPv6AllowedSet()
+
 	var sb strings.Builder
 	for _, peer := range a.Peers {
 		if peer.DNSLabel == "" {
@@ -281,13 +428,31 @@ func (a *Account) GetPeersCustomZone(ctx context.Context, dnsDomain string) nbdn
 		sb.WriteString(peer.DNSLabel)
 		sb.WriteString(domainSuffix)
 
+		fqdn := sb.String()
 		customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
-			Name:  sb.String(),
+			Name:  fqdn,
 			Type:  int(dns.TypeA),
 			Class: nbdns.DefaultClass,
 			TTL:   defaultTTL,
 			RData: peer.IP.String(),
 		})
+		// Only advertise AAAA for peers that have a valid IPv6, whose client supports it,
+		// and that belong to an IPv6-enabled group. Old clients don't configure v6 on their
+		// WireGuard interface, so resolving their AAAA causes connections to hang.
+		// Capability changes (client upgrade/downgrade, --disable-ipv6 toggle) propagate
+		// to other peers via SyncPeer/LoginPeer regardless of version change, so AAAA
+		// records refresh when a peer first reports the IPv6 overlay capability.
+		_, peerAllowed := ipv6AllowedPeers[peer.ID]
+		hasIPv6 := peer.IPv6.IsValid() && peer.SupportsIPv6() && peerAllowed
+		if hasIPv6 {
+			customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
+				Name:  fqdn,
+				Type:  int(dns.TypeAAAA),
+				Class: nbdns.DefaultClass,
+				TTL:   defaultTTL,
+				RData: peer.IPv6.String(),
+			})
+		}
 		sb.Reset()
 
 		for _, extraLabel := range peer.ExtraDNSLabels {
@@ -295,13 +460,23 @@ func (a *Account) GetPeersCustomZone(ctx context.Context, dnsDomain string) nbdn
 			sb.WriteString(extraLabel)
 			sb.WriteString(domainSuffix)
 
+			extraFqdn := sb.String()
 			customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
-				Name:  sb.String(),
+				Name:  extraFqdn,
 				Type:  int(dns.TypeA),
 				Class: nbdns.DefaultClass,
 				TTL:   defaultTTL,
 				RData: peer.IP.String(),
 			})
+			if hasIPv6 {
+				customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
+					Name:  extraFqdn,
+					Type:  int(dns.TypeAAAA),
+					Class: nbdns.DefaultClass,
+					TTL:   defaultTTL,
+					RData: peer.IPv6.String(),
+				})
+			}
 			sb.Reset()
 		}
 
@@ -569,8 +744,41 @@ func (a *Account) GetPeerGroups(peerID string) LookupMap {
 	return groupList
 }
 
-func (a *Account) GetTakenIPs() []net.IP {
-	var takenIps []net.IP
+// PeerIPv6Allowed reports whether the given peer participates in the IPv6 overlay.
+// Returns false if IPv6 is disabled or no groups are configured.
+func (a *Account) PeerIPv6Allowed(peerID string) bool {
+	_, ok := a.peerIPv6AllowedSet()[peerID]
+	return ok
+}
+
+// peerIPv6AllowedSet returns the set of peer IDs that participate in the IPv6 overlay:
+// members of any IPv6-enabled group, plus every embedded proxy peer (which sit outside
+// regular group membership but must reach v6-enabled peers).
+func (a *Account) peerIPv6AllowedSet() map[string]struct{} {
+	result := make(map[string]struct{})
+	if len(a.Settings.IPv6EnabledGroups) == 0 {
+		return result
+	}
+	for _, groupID := range a.Settings.IPv6EnabledGroups {
+		group, ok := a.Groups[groupID]
+		if !ok {
+			continue
+		}
+		for _, peerID := range group.Peers {
+			result[peerID] = struct{}{}
+		}
+	}
+	for id, p := range a.Peers {
+		if p != nil && p.ProxyMeta.Embedded {
+			result[id] = struct{}{}
+		}
+	}
+	return result
+}
+
+// GetTakenIPs returns all peer IP addresses currently allocated in the account.
+func (a *Account) GetTakenIPs() []netip.Addr {
+	takenIps := make([]netip.Addr, 0, len(a.Peers))
 	for _, existingPeer := range a.Peers {
 		takenIps = append(takenIps, existingPeer.IP)
 	}
@@ -927,10 +1135,17 @@ func (a *Account) connResourcesGenerator(ctx context.Context, targetPeer *nbpeer
 
 				if len(rule.Ports) == 0 && len(rule.PortRanges) == 0 {
 					rules = append(rules, &fr)
-					continue
+				} else {
+					rules = append(rules, expandPortsAndRanges(fr, rule, targetPeer)...)
 				}
 
-				rules = append(rules, expandPortsAndRanges(fr, rule, targetPeer)...)
+				rules = appendIPv6FirewallRule(rules, rulesExists, peer, targetPeer, rule, firewallRuleContext{
+					direction:   direction,
+					dirStr:      strconv.Itoa(direction),
+					protocolStr: string(protocol),
+					actionStr:   string(rule.Action),
+					portsJoined: strings.Join(rule.Ports, ","),
+				})
 			}
 		}, func() ([]*nbpeer.Peer, []*FirewallRule) {
 			return peers, rules
@@ -1045,7 +1260,7 @@ func (a *Account) GetPostureChecks(postureChecksID string) *posture.Checks {
 	return nil
 }
 
-func (a *Account) getRouteFirewallRules(ctx context.Context, peerID string, policies []*Policy, route *route.Route, validatedPeersMap map[string]struct{}, distributionPeers map[string]struct{}) []*RouteFirewallRule {
+func (a *Account) getRouteFirewallRules(ctx context.Context, peerID string, policies []*Policy, route *route.Route, validatedPeersMap map[string]struct{}, distributionPeers map[string]struct{}, includeIPv6 bool) []*RouteFirewallRule {
 	var fwRules []*RouteFirewallRule
 	for _, policy := range policies {
 		if !policy.Enabled {
@@ -1058,7 +1273,7 @@ func (a *Account) getRouteFirewallRules(ctx context.Context, peerID string, poli
 			}
 
 			rulePeers := a.getRulePeers(rule, policy.SourcePostureChecks, peerID, distributionPeers, validatedPeersMap)
-			rules := generateRouteFirewallRules(ctx, route, rule, rulePeers, FirewallRuleDirectionIN)
+			rules := generateRouteFirewallRules(ctx, route, rule, rulePeers, FirewallRuleDirectionIN, includeIPv6)
 			fwRules = append(fwRules, rules...)
 		}
 	}
@@ -1140,7 +1355,7 @@ func (a *Account) GetPeerNetworkResourceFirewallRules(ctx context.Context, peer 
 		resourceAppliedPolicies := resourcePolicies[string(route.GetResourceID())]
 		distributionPeers := getPoliciesSourcePeers(resourceAppliedPolicies, a.Groups)
 
-		rules := a.getRouteFirewallRules(ctx, peer.ID, resourceAppliedPolicies, route, validatedPeersMap, distributionPeers)
+		rules := a.getRouteFirewallRules(ctx, peer.ID, resourceAppliedPolicies, route, validatedPeersMap, distributionPeers, peer.SupportsIPv6() && peer.IPv6.IsValid())
 		for _, rule := range rules {
 			if len(rule.SourceRanges) > 0 {
 				routesFirewallRules = append(routesFirewallRules, rule)
@@ -1429,6 +1644,53 @@ func (a *Account) injectServiceProxyPolicies(ctx context.Context, service *servi
 		a.injectTargetProxyPolicies(ctx, service, target, proxyPeers)
 	}
 
+	a.injectPrivateServicePolicies(service, proxyPeers)
+}
+
+// injectPrivateServicePolicies synthesises an in-memory ACL: AccessGroups → cluster proxy peers on TCP 80/443.
+func (a *Account) injectPrivateServicePolicies(svc *service.Service, proxyPeers []*nbpeer.Peer) {
+	if !svc.Private {
+		return
+	}
+	if len(svc.AccessGroups) == 0 {
+		return
+	}
+	if len(proxyPeers) == 0 {
+		return
+	}
+	for _, proxyPeer := range proxyPeers {
+		a.Policies = append(a.Policies, a.createPrivateServicePolicy(svc, proxyPeer))
+	}
+}
+
+func (a *Account) createPrivateServicePolicy(svc *service.Service, proxyPeer *nbpeer.Peer) *Policy {
+	policyID := fmt.Sprintf("private-access-%s-%s", svc.ID, proxyPeer.ID)
+	sources := append([]string(nil), svc.AccessGroups...)
+	return &Policy{
+		ID:      policyID,
+		Name:    fmt.Sprintf("Private Access to %s", svc.Name),
+		Enabled: true,
+		Rules: []*PolicyRule{
+			{
+				ID:       policyID,
+				PolicyID: policyID,
+				Name:     fmt.Sprintf("Allow access groups to reach %s", svc.Name),
+				Enabled:  true,
+				Sources:  sources,
+				DestinationResource: Resource{
+					ID:   proxyPeer.ID,
+					Type: ResourceTypePeer,
+				},
+				Bidirectional: false,
+				Protocol:      PolicyRuleProtocolTCP,
+				Action:        PolicyTrafficActionAccept,
+				PortRanges: []RulePortRange{
+					{Start: 80, End: 80},
+					{Start: 443, End: 443},
+				},
+			},
+		},
+	}
 }
 
 func (a *Account) injectTargetProxyPolicies(ctx context.Context, service *service.Service, target *service.Target, proxyPeers []*nbpeer.Peer) {
@@ -1575,7 +1837,7 @@ func shouldCheckRulesForNativeSSH(supportsNative bool, rule *PolicyRule, peer *n
 
 // peerSupportedFirewallFeatures checks if the peer version supports port ranges.
 func peerSupportedFirewallFeatures(peerVer string) supportedFeatures {
-	if strings.Contains(peerVer, "dev") {
+	if version.IsDevelopmentVersion(peerVer) {
 		return supportedFeatures{true, true}
 	}
 
@@ -1595,24 +1857,32 @@ func peerSupportedFirewallFeatures(peerVer string) supportedFeatures {
 }
 
 // filterZoneRecordsForPeers filters DNS records to only include peers to connect.
+// AAAA records are excluded when the requesting peer lacks IPv6 capability.
 func filterZoneRecordsForPeers(peer *nbpeer.Peer, customZone nbdns.CustomZone, peersToConnect, expiredPeers []*nbpeer.Peer) []nbdns.SimpleRecord {
 	filteredRecords := make([]nbdns.SimpleRecord, 0, len(customZone.Records))
-	peerIPs := make(map[string]struct{})
+	peerIPs := make(map[netip.Addr]struct{}, len(peersToConnect)+len(expiredPeers)+2)
+	includeIPv6 := peer.SupportsIPv6() && peer.IPv6.IsValid()
 
-	// Add peer's own IP to include its own DNS records
-	peerIPs[peer.IP.String()] = struct{}{}
-
-	for _, peerToConnect := range peersToConnect {
-		peerIPs[peerToConnect.IP.String()] = struct{}{}
+	addPeerIPs := func(p *nbpeer.Peer) {
+		peerIPs[p.IP] = struct{}{}
+		if includeIPv6 && p.IPv6.IsValid() {
+			peerIPs[p.IPv6] = struct{}{}
+		}
 	}
 
-	for _, expiredPeer := range expiredPeers {
-		peerIPs[expiredPeer.IP.String()] = struct{}{}
+	addPeerIPs(peer)
+	for _, p := range peersToConnect {
+		addPeerIPs(p)
+	}
+	for _, p := range expiredPeers {
+		addPeerIPs(p)
 	}
 
 	for _, record := range customZone.Records {
-		if _, exists := peerIPs[record.RData]; exists {
-			filteredRecords = append(filteredRecords, record)
+		if addr, err := netip.ParseAddr(record.RData); err == nil {
+			if _, exists := peerIPs[addr.Unmap()]; exists {
+				filteredRecords = append(filteredRecords, record)
+			}
 		}
 	}
 
