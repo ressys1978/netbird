@@ -195,7 +195,7 @@ func (pm *ProfileManager) ToggleLoginHint(disable bool) error {
 		return fmt.Errorf("get active profile: %w", err)
 	}
 
-	state, err := pm.GetProfileState(activeProf.Name)
+	state, err := pm.GetProfileState(ID(activeProf.Name))
 	if err != nil {
 		state = &ProfileState{}
 	}

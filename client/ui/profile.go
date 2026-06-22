@@ -67,7 +67,7 @@ func (s *serviceClient) showProfilesUI() {
 			}
 			nameLabel.SetText(formatProfileLabel(profile, profiles))
 
-			profileState, err := s.profileManager.GetProfileState(profile.Name)
+			profileState, err := s.profileManager.GetProfileState(profilemanager.ID(profile.Name))
 			loginHintEnabled := true
 			if err == nil {
 				loginHintEnabled = !profileState.DisableLoginHint
@@ -656,7 +656,7 @@ func (p *profileMenu) refresh() {
 
 	loginHintCtx, loginHintCancel := context.WithCancel(context.Background())
 	loginHintEnabled := true
-	if activeProfState, stateErr := p.profileManager.GetProfileState(activeProf.ProfileName); stateErr == nil {
+	if activeProfState, stateErr := p.profileManager.GetProfileState(profilemanager.ID(activeProf.ProfileName)); stateErr == nil {
 		loginHintEnabled = !activeProfState.DisableLoginHint
 	}
 	loginHintItem := p.profileMenuItem.AddSubMenuItem("Login Hint", "Pre-fill email on SSO login")

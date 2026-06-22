@@ -50,7 +50,7 @@ func (pm *ProfileManager) GetActiveProfileState() (*ProfileState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get active profile: %w", err)
 	}
-	return pm.GetProfileState(activeProf.Name)
+	return pm.GetProfileState(ID(activeProf.Name))
 }
 
 func (pm *ProfileManager) SetActiveProfileState(state *ProfileState) error {
