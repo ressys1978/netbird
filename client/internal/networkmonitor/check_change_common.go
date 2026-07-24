@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -47,6 +49,16 @@ func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Next
 
 		msg := (*unix.RtMsghdr)(unsafe.Pointer(&buf[0]))
 
+		// On Darwin, RTM_DELETE can be part of a normal VPN connection sequence,
+		// causing spurious disconnects. The wakeup detector provides some resilience against
+		// undetected network loss from sleep, and network recovery is still detected via RTM_ADD.
+		// By ignoring RTM_DELETE, we prioritize stability during VPN handovers over
+		// immediate detection of network loss.
+		if runtime.GOOS == "darwin" && msg.Type == unix.RTM_DELETE {
+			log.Debugf("Network monitor: ignoring RTM_DELETE on darwin to avoid spurious disconnects from VPNs")
+			continue
+		}
+
 		switch msg.Type {
 		// handle route changes
 		case unix.RTM_ADD, syscall.RTM_DELETE:
@@ -64,6 +76,12 @@ func routeCheck(ctx context.Context, fd int, nexthopv4, nexthopv6 systemops.Next
 			if route.Interface != nil {
 				intf = route.Interface.Name
 			}
+
+			if strings.HasPrefix(intf, "utun") || strings.HasPrefix(intf, "ipsec") || (intf == "<nil>" && msg.Type == unix.RTM_ADD) {
+				log.Debugf("Network monitor: ignoring route change for interface %s", intf)
+				continue
+			}
+
 			switch msg.Type {
 			case unix.RTM_ADD:
 				if systemops.IgnoreAddedDefaultRoute(flags) {

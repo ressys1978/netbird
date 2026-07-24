@@ -143,6 +143,28 @@ func (t *Tray) fillProfileSubmenu() {
 		t.svc.WindowManager.OpenSettings("profiles")
 	})
 	manageProfiles.SetEnabled(!disableProfiles)
+
+	t.profileSubmenu.AddSeparator()
+	pm := profilemanager.NewProfileManager()
+	loginHintEnabled := true
+	if activeProf, err := pm.GetActiveProfile(); err == nil {
+		if state, err := pm.GetProfileState(activeProf.ID); err == nil {
+			loginHintEnabled = !state.DisableLoginHint
+		}
+	}
+	loginHintLabel := "✓ Login Hint"
+	if !loginHintEnabled {
+		loginHintLabel = "  Login Hint"
+	}
+	loginHintItem := t.profileSubmenu.Add(loginHintLabel)
+	loginHintItem.OnClick(func(*application.Context) {
+		newDisable := loginHintEnabled
+		if err := pm.ToggleLoginHint(newDisable); err != nil {
+			log.Errorf("toggle login hint: %v", err)
+			return
+		}
+		t.relayoutMenu()
+	})
 	log.Infof("tray fillProfileSubmenu: %d profile(s) for user %q, active=%q", len(profiles), username, activeName)
 	if t.profileSubmenuItem != nil && activeName != "" {
 		t.profileSubmenuItem.SetLabel(activeName)

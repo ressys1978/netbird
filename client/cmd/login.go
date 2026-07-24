@@ -358,10 +358,15 @@ func handleSSOLogin(ctx context.Context, cmd *cobra.Command, loginResp *proto.Lo
 	}
 
 	if resp.Email != "" {
-		err = pm.SetActiveProfileState(&profilemanager.ProfileState{
-			Email: resp.Email,
-		})
-		if err != nil {
+		var state *profilemanager.ProfileState
+		if activeProf, err := pm.GetActiveProfile(); err == nil {
+			state, _ = pm.GetProfileState(activeProf.ID)
+		}
+		if state == nil {
+			state = &profilemanager.ProfileState{}
+		}
+		state.Email = resp.Email
+		if err := pm.SetActiveProfileState(state); err != nil {
 			log.Warnf("failed to set active profile email: %v", err)
 		}
 	}

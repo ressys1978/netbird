@@ -165,6 +165,7 @@ func (pm *ProfileManager) setActiveProfileState(id ID) error {
 }
 
 // GetLoginHint retrieves the email from the active profile to use as login_hint.
+// Returns empty string if login hint is disabled for the active profile.
 func GetLoginHint() string {
 	pm := NewProfileManager()
 	activeProf, err := pm.GetActiveProfile()
@@ -179,5 +180,26 @@ func GetLoginHint() string {
 		return ""
 	}
 
+	if profileState.DisableLoginHint {
+		return ""
+	}
+
 	return profileState.Email
+}
+
+// ToggleLoginHint enables or disables login hint for the active profile,
+// preserving existing state fields.
+func (pm *ProfileManager) ToggleLoginHint(disable bool) error {
+	activeProf, err := pm.GetActiveProfile()
+	if err != nil {
+		return fmt.Errorf("get active profile: %w", err)
+	}
+
+	state, err := pm.GetProfileState(activeProf.ID)
+	if err != nil {
+		state = &ProfileState{}
+	}
+
+	state.DisableLoginHint = disable
+	return pm.SetActiveProfileState(state)
 }

@@ -11,7 +11,8 @@ import (
 )
 
 type ProfileState struct {
-	Email string `json:"email"`
+	Email            string `json:"email"`
+	DisableLoginHint bool   `json:"disable_login_hint,omitempty"`
 }
 
 // GetProfileState reads the per-profile state file keyed by profile ID.
